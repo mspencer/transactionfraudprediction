@@ -1,20 +1,28 @@
+# slim python = parent image
 FROM python:3.11-slim
 
+# python environment variables for optimization
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8080 \
+    ARTIFACT_DIR=artifacts
+
+# set the working directory = /app
 WORKDIR /app
 
-# system dependencies needed for lightgbm/xgboost/catboost wheels
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
+# copy dependency definitions
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
+# copy scripting files
 COPY inference.py main.py ./
+# copy the artifacts directory
 COPY artifacts/ ./artifacts/
 
-ENV ARTIFACT_DIR=artifacts
-ENV PORT=8080
+# install required dependencies, then python packages
+RUN pip install --no-cache-dir -r requirements.txt
 
-# CloudRun sets $PORT at runtime; uvicorn must bind to it
-CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT}
+# expose the default Cloud Run port
+EXPOSE 8080
+
+# run uvicorn pointing to the app inside the api package
+# Cloud Run injects the PORT env var automatically ${PORT}
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
