@@ -8,6 +8,7 @@ Endpoints:
     POST /score    -> score one or more transactions
 """
 
+from contextlib import asynccontextmanager
 import logging
 import os
 
@@ -22,17 +23,28 @@ logger = logging.getLogger(__name__)
 
 ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "artifacts")
 
-app = FastAPI(title="Fraud Scoring API")
-
 # loaded once at container startup, reused across requests
 _artifacts = None
 
-@app.on_event("startup")
-async def startup_event():
+def get_artifacts():
+    # lazy loader: loads model artifacts on first demand if not already in memory
     global _artifacts
-    logger.info(f"Loading artifacts from {ARTIFACT_DIR}")
-    _artifacts = load_artifacts(ARTIFACT_DIR)
-    logger.info(f"Loaded {_artifacts['model_type']} model. Ready to serve.")
+    if _artifacts is None:
+        logger.info(f"Loading artifacts from {ARTIFACT_DIR}")
+        _artifacts = load_artifacts(ARTIFACT_DIR)
+        logger.info(f"Loaded {_artifacts['model_type']} model. Ready to serve.")
+    return _artifacts
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # pre warm up model cache during startup
+    try:
+        get_artifacts()
+    except Exception as e:
+        logger.error(f"Failed to load artifacts on startup: {e}")
+    yield
+
+app = FastAPI(title="Fraud Scoring API", lifespan=lifespan)
 
 class ScoreRequest(BaseModel):
     # accepts a list of raw transaction records as dicts
@@ -40,12 +52,17 @@ class ScoreRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": _artifacts is not None, "model_type": _artifacts['model_type'] if _artifacts else None}
+    return {
+        "status": "ok",
+        "model_loaded": _artifacts is not None,
+        "model_type": _artifacts['model_type'] if _artifacts else None
+    }
 
 @app.post("/score")
 async def score(request: ScoreRequest):
-    if _artifacts is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    artifacts = get_artifacts()
+    if artifacts is None:
+        raise HTTPException(status_code=503, detail="Model unavailable")
 
     if not request.transactions:
         raise HTTPException(status_code=400, detail="No transactions provided")

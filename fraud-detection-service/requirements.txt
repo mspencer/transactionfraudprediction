@@ -2,6 +2,7 @@ fastapi==0.136.1
 uvicorn==0.47.0
 pandas==3.0.3
 numpy==2.4.4
+pyarrow>=17.0.0
 lightgbm==4.5.0
 pydantic==2.13.4
 xgboost>=2.105

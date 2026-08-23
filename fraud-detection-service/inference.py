@@ -10,15 +10,13 @@ Prerequisite:
 
 import json
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
 # ---------------------
 # config: must match the training config
 # ---------------------
 UID_COLS = ['card1', 'card2', 'card3', 'card4', 'card5', 'card6', 'addr1', 'addr2', 'D1n', 'P_emaildomain']
-
-# default operating threshold: use best threshold from lightGBM = 0.253
-# can be changed depending on business decision
 DEFAULT_THRESHOLD = 0.253
 
 # ---------------------
@@ -27,7 +25,15 @@ DEFAULT_THRESHOLD = 0.253
 def load_artifacts(artifact_dir='artifacts'):
     artifact_dir = Path(artifact_dir)
 
+    # Load uid_stats and set index to UID for 0(1) hash map lookups & downcast types
     uid_stats = pd.read_pickle(artifact_dir / 'uid_stats.pkl')
+    if 'UID' in uid_stats.columns:
+        uid_stats = uid_stats.set_index('UID')
+    # Downcast floats/ints to reduce RAM footprint by ~50%
+    for col in uid_stats.select_dtypes(include=['float64']).columns:
+        uid_stats[col] = uid_stats[col].astype('float32')
+    for col in uid_stats.select_dtypes(include=['int64']).columns:
+        uid_stats[col] = uid_stats[col].astype('int32')        
 
     with open(artifact_dir / 'global_mean.json') as f:
         global_mean = json.load(f)['global_mean']
@@ -41,6 +47,7 @@ def load_artifacts(artifact_dir='artifacts'):
     model_type = config['model_type']
     if model_type == 'lightgbm':
         import lightgbm as lgb
+        # load directly as LightGBM Booster (lightweight C++ reference)
         model = lgb.Booster(model_file=str(artifact_dir / 'model_lightgbm.txt'))
     elif model_type == 'xgboost':
         from xgboost import XGBClassifier
@@ -67,24 +74,25 @@ def load_artifacts(artifact_dir='artifacts'):
 # ---------------------
 # feature engineering
 # ---------------------
-def prepare_features(raw_df, uid_stats, global_mean, model_type, cat_features, train_categories, uid_cols=UID_COLS):
-    # reproduce the same feature engineering on new/raw transaction as during the training
-    df = raw_df.copy()
-
-    # prepare the feature engineering
-    df['TransactionDay'] = (df['TransactionDT'] / 86400).astype(int)
+def prepare_features(df, uid_stats, global_mean, model_type, cat_features, train_categories, uid_cols=UID_COLS):
+    # vectorized string concatenation for UID construction
+    df['TransactionDay'] = (df['TransactionDT'] / 86400).astype(np.int32)
     df['D1n'] = df['TransactionDay'] - df['D1']
 
-    # UID construction
-    df['UID'] = df[uid_cols].fillna('NA').astype(str).agg('_'.join, axis=1)
+    # vectorized fast join replacing .agg('_'.join, axis=1)
+    df['UID'] = df[uid_cols].fillna('NA').astype(str)
+    for col in uid_cols[1:]:
+        df['UID'] = df['UID'] + '_' + df[col].fillna('NA').astype(str)
 
-    # merge UID stats computed at training time
+    # index-based map/join instead of  full DataFrame merge
     df = df.drop(columns=[c for c in ['UID_mean', 'UID_std', 'UID_count'] if c in df.columns], errors='ignore')
-    df = df.merge(uid_stats, on='UID', how='left')
 
-    df['TransactionAmt_ratio'] = df['TransactionAmt'] / df['UID_mean'].fillna(global_mean)
-    df['UID_std'] = df['UID_std'].fillna(0)
-    df['UID_count'] = df['UID_count'].fillna(0)
+    # fast lookup from indexed uid_stats
+    df = df.join(uid_stats, on='UID', how='left')
+
+    df['TransactionAmt_ratio'] = (df['TransactionAmt'] / df['UID_mean'].fillna(global_mean)).astype('float32')
+    df['UID_std'] = df['UID_std'].fillna(0).astype('float32')
+    df['UID_count'] = df['UID_count'].fillna(0).astype('int32')
 
     # categorical handling must meet the model requirements
     if model_type in ('lightgbm', 'xgboost'):
@@ -111,7 +119,7 @@ def score_transactions(raw_df, artifacts):
     threshold = artifacts['threshold']
 
     df = prepare_features(
-        raw_df,
+        raw_df.copy(),
         uid_stats=artifacts['uid_stats'],
         global_mean=artifacts['global_mean'],
         model_type=model_type,
